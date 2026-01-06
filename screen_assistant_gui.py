@@ -16,8 +16,10 @@ from openai import OpenAI
 from PIL import Image, ImageTk
 import mss
 import markdown
-from pynput import keyboard
-from pynput.keyboard import Key, KeyCode, Listener
+import mss
+import markdown
+import win32con
+import httpx
 
 # Load environment variables
 load_dotenv()
@@ -32,7 +34,11 @@ class ScreenAssistantCore:
         if not api_key:
             raise ValueError("OPENAI_API_KEY is required")
         
-        self.client = OpenAI(api_key=api_key)
+        # Configure SSL verification
+        disable_ssl = os.getenv("DISABLE_SSL_VERIFY", "false").lower() == "true"
+        http_client = httpx.Client(verify=not disable_ssl)
+        
+        self.client = OpenAI(api_key=api_key, http_client=http_client)
         self.model = "gpt-4o"
         # Initialize conversation history
         self.conversation_history = [
@@ -290,6 +296,9 @@ class SpotlightWindow:
         self.root.bind("<Escape>", self.hide_window)
         self.root.bind_all("<Escape>", self.hide_window)  # Also bind globally
         
+        # Handle "X" button click - don't destroy, just hide
+        self.root.protocol("WM_DELETE_WINDOW", lambda: self.hide_window(None))
+        
         # Don't close on click outside - use Escape instead
         # self.root.bind("<Button-1>", self.check_click_outside)
         
@@ -469,73 +478,67 @@ class SpotlightWindow:
 
 
 class GlobalHotkeyManager:
-    """Manages global hotkey for showing/hiding the window."""
+    """Manages global hotkey using native Windows API to avoid hooks."""
     
     def __init__(self, window: SpotlightWindow):
         self.window = window
-        self.listener = None
-        self.pressed_keys = set()
-        self.target_char = 'a'
+        self.running = False
+        self.thread = None
         
     def start(self):
-        """Start listening for hotkeys."""
-        self.listener = Listener(
-            on_press=self.on_press,
-            on_release=self.on_release
-        )
-        self.listener.start()
+        """Start listening for hotkeys in a separate thread."""
+        self.running = True
+        self.thread = threading.Thread(target=self._listen)
+        self.thread.daemon = True
+        self.thread.start()
     
-    def on_press(self, key):
-        """Handle key press."""
-        try:
-            # Handle special keys
-            if key in [Key.cmd, Key.cmd_l, Key.cmd_r, Key.shift, Key.shift_l, Key.shift_r]:
-                self.pressed_keys.add(key)
-                return
+    def _listen(self):
+        """Native message loop for hotkey."""
+        import ctypes
+        from ctypes import wintypes
+        import win32con
+        
+        user32 = ctypes.windll.user32
+        
+        # Define constants
+        MOD_ALT = 0x0001
+        MOD_CONTROL = 0x0002
+        MOD_SHIFT = 0x0004
+        VK_A = 0x41
+        HOTKEY_ID = 1
+        
+        # Register Hotkey: Ctrl + Shift + A
+        if not user32.RegisterHotKey(None, HOTKEY_ID, MOD_CONTROL | MOD_SHIFT, VK_A):
+            print("Failed to register native hotkey: Ctrl+Shift+A")
+            return
             
-            # Handle regular character keys
-            if hasattr(key, 'char') and key.char:
-                self.pressed_keys.add(key)
-                
-                # Check for Cmd+Shift+A (custom shortcut to avoid Spotlight conflict)
-                cmd_pressed = (Key.cmd in self.pressed_keys or 
-                             Key.cmd_l in self.pressed_keys or 
-                             Key.cmd_r in self.pressed_keys)
-                shift_pressed = (Key.shift in self.pressed_keys or 
-                               Key.shift_l in self.pressed_keys or 
-                               Key.shift_r in self.pressed_keys)
-                
-                if cmd_pressed and shift_pressed and key.char.lower() == self.target_char:
-                    self.window.toggle_window()
-                    return False  # Suppress the key event
-            else:
-                # Handle other special keys
-                self.pressed_keys.add(key)
-                
-        except AttributeError:
-            pass
-        except Exception:
-            pass
-    
-    def on_release(self, key):
-        """Handle key release."""
+        print("Native hotkey registered: Ctrl+Shift+A")
+        
         try:
-            # Remove the key and all its variants
-            keys_to_remove = [k for k in self.pressed_keys if 
-                           (key == k) or 
-                           (key in [Key.cmd, Key.cmd_l, Key.cmd_r] and k in [Key.cmd, Key.cmd_l, Key.cmd_r]) or
-                           (key in [Key.shift, Key.shift_l, Key.shift_r] and k in [Key.shift, Key.shift_l, Key.shift_r])]
-            for k in keys_to_remove:
-                self.pressed_keys.discard(k)
-        except AttributeError:
-            pass
-        except Exception:
-            pass
+            msg = wintypes.MSG()
+            while self.running:
+                # GetMessage blocks until a message is received
+                # We use PeekMessage with a small sleep to allow clean exit if needed
+                if user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 1): # PM_REMOVE
+                    if msg.message == win32con.WM_HOTKEY:
+                        if msg.wParam == HOTKEY_ID:
+                            self.on_activate()
+                    user32.TranslateMessage(ctypes.byref(msg))
+                    user32.DispatchMessageW(ctypes.byref(msg))
+                else:
+                    import time
+                    time.sleep(0.01)
+        finally:
+            user32.UnregisterHotKey(None, HOTKEY_ID)
+    
+    def on_activate(self):
+        """Handle hotkey activation."""
+        if self.window.root:
+            self.window.root.after(0, self.window.toggle_window)
     
     def stop(self):
         """Stop listening for hotkeys."""
-        if self.listener:
-            self.listener.stop()
+        self.running = False
 
 
 def main():
@@ -556,7 +559,7 @@ def main():
             hotkey_manager = GlobalHotkeyManager(window)
             hotkey_manager.start()
             print("Screen Assistant GUI is running!")
-            print("Press Cmd+Shift+A to toggle the assistant window.")
+            print("Press Ctrl+Shift+A to toggle the assistant window.")
             print("(Note: If hotkey doesn't work, grant Accessibility permissions)")
         except Exception as e:
             print(f"Hotkey setup failed: {e}")
